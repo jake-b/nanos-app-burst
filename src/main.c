@@ -1,5 +1,5 @@
 /*******************************************************************************
-*   Burstcoin Wallet App for Nano Ledger S.
+*   Burstcoin Wallet App for Nano Ledger S. Updated By Waves community.
 *   Copyright (c) 2017-2018 Jake B.
 * 
 *   Based on Sample code provided and (c) 2016 Ledger
@@ -20,8 +20,10 @@
 #include <stdbool.h>
 
 #include "main.h"
+#include "constants.h"
 #include "crypto/curve25519_i64.h"
 #include "crypto/rs_address.h"
+#include "crypto/ed25519/additions/curve_sigs.h"
 
 // Ledger Stuff
 #include "ui.h"
@@ -65,7 +67,8 @@ unsigned char G_io_seproxyhal_spi_buffer[IO_SEPROXYHAL_BUFFER_SIZE_B];
 
 // Stuff for the SHA-256 hashing
 volatile unsigned int hashCount;     // notification to restart the hash
-cx_sha256_t hash;
+volatile unsigned int bufferUsed;
+unsigned char buffer[MAX_DATA_SIZE];
 
 // Supported device errors for preprocessor
 #ifdef TARGET_BLUE
@@ -116,7 +119,7 @@ unsigned short io_exchange_al(unsigned char channel, unsigned short tx_len) {
     return 0;
 }
 
-// Get a public key from the 44'/30' keypath.
+// Get a public key from the 44'/5741564' keypath.
 static bool getPublicKeyForIndex(int index, cx_ecfp_public_key_t* publicKey) {
     if (!os_global_pin_is_validated()) {
         return false;
@@ -129,8 +132,8 @@ static bool getPublicKeyForIndex(int index, cx_ecfp_public_key_t* publicKey) {
         return true;
     }
 
-    // BURST keypath of 44'/30'/n'/0'/0'
-    uint32_t path[] = {44 | 0x80000000, 30 | 0x80000000, index | 0x80000000, 0x80000000, 0x80000000};
+    // WAVES keypath of 44'/5741564'0'/0'/n' https://github.com/satoshilabs/slips/pull/189/
+    uint32_t path[] = {44 | 0x80000000, 5741564 | 0x80000000, 0x80000000, 0x80000000, index | 0x80000000};
 
     unsigned char privateKeyData[32];
     os_perso_derive_node_bip32(CX_CURVE_Ed25519, path, 5, privateKeyData, NULL);
@@ -148,71 +151,44 @@ static bool getPublicKeyForIndex(int index, cx_ecfp_public_key_t* publicKey) {
     return true;
 }
 
-// // Get a signing key from the 44'/30' keypath.
-static bool getSigningKeyForIndex(int index, cx_ecfp_private_key_t* privateKey) {
+// // Get a signing key from the 44'/5741564' keypath.
+// todo receive link to privateKeyData array and returns boolean
+static unsigned char* getSigningKeyForIndex(int index) {
     if (!os_global_pin_is_validated()) {
         return false;
     }
 
-    // BURST keypath of 44'/30'/n'/0'/0'
-    uint32_t path[] = {44 | 0x80000000, 30 | 0x80000000, index | 0x80000000, 0x80000000, 0x80000000};
+    // WAVES keypath of 44'/5741564'0'/0'/n' https://github.com/satoshilabs/slips/pull/189/
+    uint32_t path[] = {44 | 0x80000000, 5741564 | 0x80000000, 0x80000000, 0x80000000, index | 0x80000000};
 
     unsigned char privateKeyData[32];
     os_perso_derive_node_bip32(CX_CURVE_Ed25519, path, 5, privateKeyData, NULL);
-    keygen25519(NULL, privateKey->d, privateKeyData);
-    privateKey->curve = CX_CURVE_Curve25519;
-    privateKey->d_len = 32;
 
-    return true;
+    clamp25519(privateKeyData);
+
+    return privateKeyData;
 }
 
 // Hanlde a signing request -- called both from the main apdu loop as well as from
 // the button handler after the user verifies the transaction.
 bool handleSigning(volatile unsigned int *tx, volatile unsigned int *flags) {
-    // If if this is the first hash, then initialize the SHA-256 session
-    if (hashCount == 0) {
-        // This is the first segment to hash
-        cx_sha256_init(&hash);
-    }
-
-    // Update the hash with the data from this segment.
-    cx_hash(&hash.header, 0, G_io_apdu_buffer+5, G_io_apdu_buffer[4], NULL);
-    hashCount++;
+    // Update the data from this segment.
+    os_memmove(buffer, G_io_apdu_buffer+5, G_io_apdu_buffer[4]);
+    bufferUsed = bufferUsed + G_io_apdu_buffer[4];
 
     // If this is the last segment, calculate the signature
     if (G_io_apdu_buffer[2] == P1_LAST) {
-        cx_ecfp_private_key_t signingKey;
-        getSigningKeyForIndex(0, &signingKey);
-        
-        // m = hash(Z, message)
-        cx_hash(&hash.header, CX_LAST, G_io_apdu_buffer, 0, tmpCtx.signingContext.m);
+        unsigned char signature[64];
+        unsigned char random[32];
+        unsigned char* privateKeyData = getSigningKeyForIndex(0);
+        cx_rng(random, sizeof(random));
 
-        // x = hash(m, s)
-        cx_sha256_init(&hash);
-        cx_hash(&hash.header, 0, tmpCtx.signingContext.m, 32, NULL);
-        cx_hash(&hash.header, CX_LAST, signingKey.d, 32, tmpCtx.signingContext.x);
+        curve25519_sign(signature, privateKeyData, buffer, bufferUsed, random);
 
-        // keygen25519(Y, NULL, x); 
-        // reuse G_io_apdu_buffer = Y to save some memory.
-        keygen25519(G_io_apdu_buffer, NULL, tmpCtx.signingContext.x);
+        memcpy(G_io_apdu_buffer, signature, sizeof(signature));
 
-        // r = hash(m+Y);
-        cx_sha256_init(&hash);
-        cx_hash(&hash.header, 0, tmpCtx.signingContext.m, 32, NULL);
-        cx_hash(&hash.header, CX_LAST, G_io_apdu_buffer, 32, tmpCtx.signingContext.r);
- 
-        // output (v,r) as the signature
-        // put v into G_io_apdu_buffer first, followed by r
-        //int sign25519(k25519 v, const k25519 h, const priv25519 x, const spriv25519 s)
-        sign25519(G_io_apdu_buffer, tmpCtx.signingContext.r, tmpCtx.signingContext.x, signingKey.d);
-        memcpy(G_io_apdu_buffer+32, tmpCtx.signingContext.r, 32);
-
-        // return 64 bytes to host
-        *tx=64;
-
-        // Reset for next signing
-        os_memset(&signingKey, 0, sizeof(signingKey));  // just for good measure, remove signing key from memory.
-        hashCount = 0; // Reset for next hashing/signing session.
+        *tx = sizeof(signature);
+        bufferUsed = 0;
         return false;
     }
 
@@ -241,28 +217,33 @@ void handleApdu(volatile unsigned int *flags, volatile unsigned int *tx, volatil
                     THROW(SW_INCORRECT_P1_P2);
                 }
 
-                if (hashCount == 0) {
+                if (false) {
+                    // todo fix UI to Waves Transactions
                     if (G_io_apdu_buffer)
                     ui_verify();
                     *flags |= IO_ASYNCH_REPLY;
                 } else {
                     bool more = handleSigning(tx, flags);
-                    THROW(SW_OK);    
+                    THROW(SW_OK);
                 }
-                
+
             } break;
 
             case INS_GET_PUBLIC_KEY: {
                 // Get the public key and return it.
                 cx_ecfp_public_key_t publicKey;
+                // todo return private key only for debug
+                // todo pass link to privateKeyData array
+                unsigned char* privateKeyData = getSigningKeyForIndex(0);
                 if (getPublicKeyForIndex(0, &publicKey)) {
-                    os_memmove(G_io_apdu_buffer, publicKey.W, publicKey.W_len);                
-                    *tx = publicKey.W_len;
+                    os_memmove(G_io_apdu_buffer, publicKey.W, 32);
+                    os_memmove(G_io_apdu_buffer + 32, privateKeyData, 32);
+                    *tx = 64;
                     THROW(SW_OK);
                 } else {
                     // Return an error
                     THROW(SW_INS_NOT_SUPPORTED);
-                }   
+                }
             } break;
 
             default:
@@ -300,7 +281,7 @@ void handleApdu(volatile unsigned int *flags, volatile unsigned int *tx, volatil
     }
 }
 
-static void burst_main(void) {
+static void waves_main(void) {
     volatile unsigned int rx = 0;
     volatile unsigned int tx = 0;
     volatile unsigned int flags = 0;
@@ -429,6 +410,7 @@ __attribute__((section(".boot"))) int main(void) {
     // current_text_pos = 0;
     // text_y = 60;
     hashCount = 0;
+    bufferUsed = 0;
     uiState = UI_IDLE;
 
     for (;;) {
@@ -466,7 +448,7 @@ __attribute__((section(".boot"))) int main(void) {
 
                 ui_idle();
 
-                burst_main();
+                waves_main();
             }
             CATCH(EXCEPTION_IO_RESET) {
                 // reset IO and UX before continuing

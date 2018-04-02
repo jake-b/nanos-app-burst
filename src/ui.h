@@ -1,6 +1,6 @@
 
 /*******************************************************************************
-*   Burstcoin Wallet App for Nano Ledger S.
+*   Burstcoin Wallet App for Nano Ledger S. Updated By Waves community.
 *   Copyright (c) 2017-2018 Jake B.
 * 
 *   Based on Sample code provided and (c) 2016 Ledger
@@ -35,7 +35,7 @@ enum UI_STATE { UI_IDLE, UI_VERIFY };
 #define UI_FEE       2
 #define UI_TRANSACTION_PART_MAX 3;
 
-extern enum UI_STATE uiState;
+extern enum UI_STATE ui_state;
 
 // extern unsigned int current_text_pos; // parsing cursor in the text to display
 // extern unsigned int text_y;           // current location of the displayed text

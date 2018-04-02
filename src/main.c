@@ -1,5 +1,5 @@
 /*******************************************************************************
-*   Burstcoin Wallet App for Nano Ledger S.
+*   Burstcoin Wallet App for Nano Ledger S. Updated By Waves community.
 *   Copyright (c) 2017-2018 Jake B.
 * 
 *   Based on Sample code provided and (c) 2016 Ledger
@@ -20,8 +20,8 @@
 #include <stdbool.h>
 
 #include "main.h"
-#include "crypto/curve25519_i64.h"
-#include "crypto/rs_address.h"
+#include "crypto/waves.h"
+#include "sodium/keypair.h"
 
 // Ledger Stuff
 #include "ui.h"
@@ -44,7 +44,7 @@ void check_canary() {
 }
 
 // Temporary area to sore stuff and reuse the same memory
-tmpContext_t tmpCtx;
+tmpContext_t tmp_ctx;
 
 #ifdef HAVE_U2F
 
@@ -58,14 +58,10 @@ volatile u2f_service_t u2fService;
 #endif
 
 // Non-volatile storage for the wallet app's stuff
-WIDE internalStorage_t N_storage_real;
+WIDE internal_storage_t N_storage_real;
 
 // SPI Buffer for io_event
 unsigned char G_io_seproxyhal_spi_buffer[IO_SEPROXYHAL_BUFFER_SIZE_B];
-
-// Stuff for the SHA-256 hashing
-volatile unsigned int hashCount;     // notification to restart the hash
-cx_sha256_t hash;
 
 // Supported device errors for preprocessor
 #ifdef TARGET_BLUE
@@ -116,111 +112,116 @@ unsigned short io_exchange_al(unsigned char channel, unsigned short tx_len) {
     return 0;
 }
 
-// Get a public key from the 44'/30' keypath.
-static bool getPublicKeyForIndex(int index, cx_ecfp_public_key_t* publicKey) {
-    if (!os_global_pin_is_validated()) {
-        return false;
-    }
+uint32_t deserialize_uint32_t(unsigned char *buffer)
+{
+    uint32_t value = 0;
 
-    if ((N_storage.keyIndex != NO_KEY_STORED) && (N_storage.keyIndex == index)) {
-        publicKey->W_len = 32;
-        publicKey->curve = CX_CURVE_Curve25519;
-        os_memmove(publicKey->W, N_storage.publicKey, 32);
-        return true;
-    }
+    value |= buffer[0] << 24;
+    value |= buffer[1] << 16;
+    value |= buffer[2] << 8;
+    value |= buffer[3];
+    return value;
 
-    // BURST keypath of 44'/30'/n'/0'/0'
-    uint32_t path[] = {44 | 0x80000000, 30 | 0x80000000, index | 0x80000000, 0x80000000, 0x80000000};
-
-    unsigned char privateKeyData[32];
-    os_perso_derive_node_bip32(CX_CURVE_Ed25519, path, 5, privateKeyData, NULL);
-    keygen25519(publicKey->W, NULL, privateKeyData);
-    publicKey->W_len = 32;
-    publicKey->curve = CX_CURVE_Curve25519;
-    
-    // Store the computed key in flash
-    internalStorage_t storage;
-    os_memmove(&storage, &N_storage, sizeof(internalStorage_t));
-    storage.keyIndex = index;
-    os_memmove(storage.publicKey, publicKey->W, 32);
-    nvm_write(&N_storage, (void *)&storage, sizeof(internalStorage_t));
-
-    return true;
 }
 
-// // Get a signing key from the 44'/30' keypath.
-static bool getSigningKeyForIndex(int index, cx_ecfp_private_key_t* privateKey) {
+// 20 bytes total
+void read_path_from_bytes(unsigned char *buffer, uint32_t *path) {
+    path[0] = deserialize_uint32_t(buffer);
+    path[1] = deserialize_uint32_t(buffer + 4);
+    path[2] = deserialize_uint32_t(buffer + 8);
+    path[3] = deserialize_uint32_t(buffer + 12);
+    path[4] = deserialize_uint32_t(buffer + 16);
+}
+
+static void get_keypair_by_path(const uint32_t* path, cx_ecfp_public_key_t* public_key, cx_ecfp_private_key_t* private_key) {
+    unsigned char privateKeyData[32];
+    os_perso_derive_node_bip32(CX_CURVE_Ed25519, path, 5, privateKeyData, NULL);
+    cx_ecdsa_init_private_key(CX_CURVE_Ed25519, privateKeyData, 32, private_key);
+    cx_ecdsa_init_public_key(CX_CURVE_Ed25519, NULL, 0, public_key);
+    cx_ecfp_generate_pair(CX_CURVE_Ed25519, public_key, private_key, 1);
+}
+
+// converts little endian 65 byte (0x4 32X 32Y) public key to 32 byte Y big endian form (for other applications)
+static void public_key_le_to_be(cx_ecfp_public_key_t* public_key) {
+    uint8_t public_key_be[32];
+    // copy public key little endian to big endian
+    for (uint8_t i = 0; i < 32; i++) {
+        public_key_be[i] = public_key->W[64 - i];
+    }
+    // set sign bit
+    if ((public_key->W[32] & 1) != 0) {
+        public_key_be[31] |= 0x80;
+    }
+    os_memmove(public_key->W, public_key_be, 32);
+}
+
+// Get a public key from the 44'/5741564' keypath.
+static bool get_curve25519_public_key_for_path(const uint32_t* path, cx_ecfp_public_key_t* public_key) {
     if (!os_global_pin_is_validated()) {
         return false;
     }
 
-    // BURST keypath of 44'/30'/n'/0'/0'
-    uint32_t path[] = {44 | 0x80000000, 30 | 0x80000000, index | 0x80000000, 0x80000000, 0x80000000};
+    cx_ecfp_private_key_t private_key;
+    // derive the ed25519 keys by that BIP32 path from the device
+    get_keypair_by_path(path, public_key, &private_key);
+    // clean private key
+    os_memset(private_key.d, 0, 32);
 
-    unsigned char privateKeyData[32];
-    os_perso_derive_node_bip32(CX_CURVE_Ed25519, path, 5, privateKeyData, NULL);
-    keygen25519(NULL, privateKey->d, privateKeyData);
-    privateKey->curve = CX_CURVE_Curve25519;
-    privateKey->d_len = 32;
+    public_key_le_to_be(public_key);
 
-    return true;
+    return ed25519_pk_to_curve25519(public_key->W, public_key->W);
 }
 
 // Hanlde a signing request -- called both from the main apdu loop as well as from
 // the button handler after the user verifies the transaction.
-bool handleSigning(volatile unsigned int *tx, volatile unsigned int *flags) {
-    // If if this is the first hash, then initialize the SHA-256 session
-    if (hashCount == 0) {
-        // This is the first segment to hash
-        cx_sha256_init(&hash);
-    }
 
-    // Update the hash with the data from this segment.
-    cx_hash(&hash.header, 0, G_io_apdu_buffer+5, G_io_apdu_buffer[4], NULL);
-    hashCount++;
+// like https://github.com/lenondupe/ledger-app-stellar/blob/master/src/main.c#L1784
+void handle_signing(volatile unsigned int *tx, volatile unsigned int *flags) {
+    // if this is a first chunk
+    if (tmp_ctx.signing_context.buffer_used == 0) {
+        // then there're the bip32 path in the first chunk - first 20 bytes of data
+        read_path_from_bytes(G_io_apdu_buffer + 5, tmp_ctx.signing_context.bip32);
+
+        // Update the other data from this segment
+        int data_size = G_io_apdu_buffer[4] - 20;
+        os_memmove(tmp_ctx.signing_context.buffer, G_io_apdu_buffer + 25, data_size);
+        tmp_ctx.signing_context.buffer_used += data_size;
+    } else {
+        // else update the data from entire segment.
+        os_memmove(tmp_ctx.signing_context.buffer + tmp_ctx.signing_context.buffer_used, G_io_apdu_buffer + 5, G_io_apdu_buffer[4]);
+        tmp_ctx.signing_context.buffer_used += G_io_apdu_buffer[4];
+    }
 
     // If this is the last segment, calculate the signature
     if (G_io_apdu_buffer[2] == P1_LAST) {
-        cx_ecfp_private_key_t signingKey;
-        getSigningKeyForIndex(0, &signingKey);
-        
-        // m = hash(Z, message)
-        cx_hash(&hash.header, CX_LAST, G_io_apdu_buffer, 0, tmpCtx.signingContext.m);
+        cx_ecfp_public_key_t public_key;
+        cx_ecfp_private_key_t private_key;
+        get_keypair_by_path(tmp_ctx.signing_context.bip32, &public_key, &private_key);
 
-        // x = hash(m, s)
-        cx_sha256_init(&hash);
-        cx_hash(&hash.header, 0, tmpCtx.signingContext.m, 32, NULL);
-        cx_hash(&hash.header, CX_LAST, signingKey.d, 32, tmpCtx.signingContext.x);
+        uint8_t signature[64];
+        cx_eddsa_sign(&private_key, CX_LAST, CX_SHA512, tmp_ctx.signing_context.buffer, tmp_ctx.signing_context.buffer_used, NULL, 0, signature, NULL);
 
-        // keygen25519(Y, NULL, x); 
-        // reuse G_io_apdu_buffer = Y to save some memory.
-        keygen25519(G_io_apdu_buffer, NULL, tmpCtx.signingContext.x);
+        public_key_le_to_be(&public_key);
 
-        // r = hash(m+Y);
-        cx_sha256_init(&hash);
-        cx_hash(&hash.header, 0, tmpCtx.signingContext.m, 32, NULL);
-        cx_hash(&hash.header, CX_LAST, G_io_apdu_buffer, 32, tmpCtx.signingContext.r);
- 
-        // output (v,r) as the signature
-        // put v into G_io_apdu_buffer first, followed by r
-        //int sign25519(k25519 v, const k25519 h, const priv25519 x, const spriv25519 s)
-        sign25519(G_io_apdu_buffer, tmpCtx.signingContext.r, tmpCtx.signingContext.x, signingKey.d);
-        memcpy(G_io_apdu_buffer+32, tmpCtx.signingContext.r, 32);
+        unsigned char sign_bit = public_key.W[31] & 0x80;
+        signature[63] |= sign_bit;
 
-        // return 64 bytes to host
-        *tx=64;
+        os_memmove(G_io_apdu_buffer, signature, sizeof(signature));
 
-        // Reset for next signing
-        os_memset(&signingKey, 0, sizeof(signingKey));  // just for good measure, remove signing key from memory.
-        hashCount = 0; // Reset for next hashing/signing session.
-        return false;
+        // reset all saved stuff
+//        os_memset(&private_key.d, 0, 32);
+//        os_memset(&public_key.W, 0, 32);
+//        os_memset(tmp_ctx.signing_context.bip32, 0, 20);
+//        os_memset(tmp_ctx.signing_context.buffer_used, 0, MAX_DATA_SIZE);
+        tmp_ctx.signing_context.buffer_used = 0;
+
+        *tx = sizeof(signature);
     }
-
-    return true;
+    // else wait for more data
 }
 
 // Called by both the U2F and the standard communications channel
-void handleApdu(volatile unsigned int *flags, volatile unsigned int *tx, volatile unsigned int rx) {
+void handle_apdu(volatile unsigned int *flags, volatile unsigned int *tx, volatile unsigned int rx) {
     unsigned short sw = 0;
     BEGIN_TRY {
         TRY {
@@ -241,28 +242,43 @@ void handleApdu(volatile unsigned int *flags, volatile unsigned int *tx, volatil
                     THROW(SW_INCORRECT_P1_P2);
                 }
 
-                if (hashCount == 0) {
-                    if (G_io_apdu_buffer)
-                    ui_verify();
-                    *flags |= IO_ASYNCH_REPLY;
-                } else {
-                    bool more = handleSigning(tx, flags);
-                    THROW(SW_OK);    
-                }
-                
+//                if (G_io_apdu_buffer[2] == P1_LAST) {
+//                     todo fix UI to Waves Transactions
+//                    if (G_io_apdu_buffer)
+//                        ui_verify();
+
+//                    *flags |= IO_ASYNCH_REPLY;
+//                } else {
+                    handle_signing(tx, flags);
+                    THROW(SW_OK);
+//                }
+
             } break;
 
             case INS_GET_PUBLIC_KEY: {
+                if (G_io_apdu_buffer[4] != rx - 5 || G_io_apdu_buffer[4] != 20) {
+                    // the length of the APDU should match what's int he 5-byte header.
+                    // If not fail.  Don't want to buffer overrun or anything.
+                    THROW(SW_CONDITIONS_NOT_SATISFIED);
+                }
                 // Get the public key and return it.
-                cx_ecfp_public_key_t publicKey;
-                if (getPublicKeyForIndex(0, &publicKey)) {
-                    os_memmove(G_io_apdu_buffer, publicKey.W, publicKey.W_len);                
-                    *tx = publicKey.W_len;
-                    THROW(SW_OK);
-                } else {
-                    // Return an error
-                    THROW(SW_INS_NOT_SUPPORTED);
-                }   
+                cx_ecfp_public_key_t public_key;
+
+                uint32_t path[5];
+                read_path_from_bytes(G_io_apdu_buffer + 5, &path);
+
+                if (get_curve25519_public_key_for_path(path, &public_key) != 0) {
+                    THROW(INVALID_PARAMETER);
+                }
+
+                char address[35];
+                waves_public_key_to_address(public_key.W, 'W', address);
+
+                os_memmove(G_io_apdu_buffer, public_key.W, 32);
+                os_memmove(G_io_apdu_buffer + 32, address, 35);
+
+                *tx = 67;
+                THROW(SW_OK);
             } break;
 
             default:
@@ -300,7 +316,7 @@ void handleApdu(volatile unsigned int *flags, volatile unsigned int *tx, volatil
     }
 }
 
-static void burst_main(void) {
+static void waves_main(void) {
     volatile unsigned int rx = 0;
     volatile unsigned int tx = 0;
     volatile unsigned int flags = 0;
@@ -332,7 +348,7 @@ static void burst_main(void) {
                 }
 
                 // Call the Apdu handler,
-                handleApdu(&flags, &tx, rx);
+                handle_apdu(&flags, &tx, rx);
             }
             CATCH(EXCEPTION_IO_RESET) {
                 THROW(EXCEPTION_IO_RESET);
@@ -426,10 +442,10 @@ __attribute__((section(".boot"))) int main(void) {
 
     //init_canary();
 
+    tmp_ctx.signing_context.buffer_used = 0;
     // current_text_pos = 0;
     // text_y = 60;
-    hashCount = 0;
-    uiState = UI_IDLE;
+    ui_state = UI_IDLE;
 
     for (;;) {
         // ensure exception will work as planned
@@ -442,13 +458,11 @@ __attribute__((section(".boot"))) int main(void) {
                 io_seproxyhal_init();
 
                 if (N_storage.initialized != 0x01) {
-                    internalStorage_t storage;
-                    storage.fidoTransport = 0x00;
+                    internal_storage_t storage;
+                    storage.fido_transport = 0x00;
                     storage.initialized = 0x01;
-                    storage.keyIndex = NO_KEY_STORED;
-                    os_memset(storage.publicKey, 0, 32);
                     nvm_write(&N_storage, (void *)&storage,
-                              sizeof(internalStorage_t));
+                              sizeof(internal_storage_t));
                 }
 
     #ifdef HAVE_U2F
@@ -459,14 +473,14 @@ __attribute__((section(".boot"))) int main(void) {
                     u2fService.messageBufferSize = U2F_MAX_MESSAGE_SIZE;
                     u2f_initialize_service((u2f_service_t *)&u2fService);
 
-                    USB_power_U2F(1, N_storage.fidoTransport);
+                    USB_power_U2F(1, N_storage.fido_transport);
     #else  // HAVE_U2F
                     USB_power_U2F(1, 0);
     #endif // HAVE_U2F
 
                 ui_idle();
 
-                burst_main();
+                waves_main();
             }
             CATCH(EXCEPTION_IO_RESET) {
                 // reset IO and UX before continuing

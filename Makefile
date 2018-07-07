@@ -47,7 +47,7 @@ DEFINES   += BLE_SEGMENT_SIZE=32 #max MTU, min 20
 DEFINES   += U2F_MAX_MESSAGE_SIZE=264 #257+5+2
 DEFINES   += UNUSED\(x\)=\(void\)x
 DEFINES   += APPVERSION=\"$(APPVERSION)\"
-
+DEFINES   += CX_COMPLIANCE_141
 # Compiler, assembler, and linker
 
 ifneq ($(BOLOS_ENV),)
